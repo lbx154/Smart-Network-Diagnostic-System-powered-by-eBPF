@@ -20,6 +20,7 @@ SmartNetDiag/
 ├── 📄 chaos_maker.py      # [测试工具] 基于 tc 的网络故障注入器
 ├── 📄 train_model.py      # [智能平面] 读取 CSV 数据，训练模型并评估
 ├── 📄 dashboard.py        # [应用平面] Streamlit 实时监控仪表盘
+├── 📄 adaptive_token_pacer.py  # [LLM 侧边车] 按网络状态自适应节流 LLM token 速率
 ├── 📄 visualize_data.py   # [分析工具] 简单的数据分布可视化脚本
 ├── 📄 requirements.txt    # Python 依赖库列表
 └── 📄 README.md           # 项目说明文档
@@ -130,6 +131,35 @@ streamlit run dashboard.py
 *   **功能演示**：
     *   观察 RTT 实时折线图。
     *   当后台注入故障时，观察右上角 AI 状态是否变为 🔴 **异常**。
+
+### 第四步：LLM Token 匀速生成（网络自适应节流）
+
+面向「云端 LLM 生成速率固定、客户端网络波动导致 token 浪费」的问题，新增 `adaptive_token_pacer.py` 作为 **LLM 侧边车**：
+
+1.  **采集网络健康度**：继续运行 `smart_agent.py`（或 `run_experiment.sh`）实时写入 `net_data.csv`。
+2.  **按网络动态节流 token**：在推理侧用 pacer 包裹生成流，将 token 速率限制为链路可承载的速率，避免云端过度生成。
+3.  **云端可查询的 Hint Server**：`--serve <port>` 会启动轻量 HTTP JSON 服务，云端 LLM 只需周期性 `GET /` 获取 `current_tps` 与推荐 `sleep_seconds`，即可在生成循环中自适应休眠，做到「能传多少就生成多少」。
+
+```bash
+# 示例：按词粒度匀速输出文本，RTT 升高或重传激增时自动降速
+python3 adaptive_token_pacer.py "Once upon a time in a network-aware LLM..." \
+  --csv net_data.csv --max-tps 60 --min-tps 5 --mode word
+```
+
+```bash
+# 示例：云端推理循环伪代码（Python）
+# 每 0.5s 查询 Hint Server，按返回的 sleep_seconds 控制 tokenizer 逐 token 发送
+curl http://localhost:9000 | jq
+
+while streaming:
+  hint = requests.get("http://localhost:9000", timeout=0.2).json()
+  next_token = llm.generate_next()
+  send_to_client(next_token)
+  time.sleep(hint["sleep_seconds"])
+```
+
+* 算法思路：将 95 分位 RTT 与重传计数映射为「链路质量系数」，对最大 token/s 做指数滑动平均的调节，并通过 HTTP 暴露实时速率建议。
+* 部署方式：在云端 LLM 服务器的 streaming 线程里调用 pacer（或移植其逻辑/HTTP 查询）来控制生成速率；也可在边缘代理上按 pacer 节奏向客户端回推，确保「能传多少、就生成多少」。
 
 ---
 
