@@ -2,15 +2,15 @@
 
 > **把网络诊断落地到 LLM 流式推理** —— 云端不再盲目“狂飙” token，根据链路质量实时调节生成速率，做到“网速能传多少，就生成多少”。
 
-[![eBPF](https://img.shields.io/badge/Linux-eBPF-orange.svg)](https://ebpf.io/) [![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/) [![AI](https://img.shields.io/badge/Model-Isolation%20Forest-green.svg)](https://scikit-learn.org/) [![Dashboard](https://img.shields.io/badge/LLM-Token%20Pacing-purple.svg)]()
+[![eBPF](https://img.shields.io/badge/Linux-eBPF-orange.svg)](https://ebpf.io/) [![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/) [![AI](https://img.shields.io/badge/Model-GB%20Forecaster%20%2B%20IForest-green.svg)](https://scikit-learn.org/) [![Dashboard](https://img.shields.io/badge/LLM-Token%20Pacing-purple.svg)]()
 
 ## 1️⃣ 这是一个什么项目？
 
 传统 LLM 云端推理的 token 生成速率固定，客户端网络却时快时慢：当链路抖动或吞吐下降时，云端会“过度生产”而被迫丢弃/等待，算力与带宽双重浪费。**NetDiag-LLM** 将网络异常检测与 LLM 流式生成耦合：
 
 1. **eBPF 数据面**：在内核挂载探针，秒级采集 TCP RTT、重传等真实指标，生成干净的 `net_data.csv`。  
-2. **AI 智能面**：用 Isolation Forest/滚动分位数等特征感知链路质量，自动平滑尖峰。  
-3. **LLM 侧边车**：`adaptive_token_pacer.py` 将“网络健康度”映射为 **token/s 建议值**，并通过 HTTP Hint Server 供云端/边缘节点轮询，直接控制生成循环的休眠节奏。
+2. **AI 智能面**：新增 **Gradient Boosting 未来健康度预测**（基于 RTT/重传的时间窗滞后特征）+ 传统 Isolation Forest 双模，既能识别异常，也能提前预判“下一秒链路质量”。
+3. **LLM 侧边车**：`adaptive_token_pacer.py` 将观测健康度与“下一步预测”通过 S 型映射融合为 **token/s 建议值**，并通过 HTTP Hint Server 供云端/边缘节点轮询，直接控制生成循环的休眠节奏。
 
 > 课堂 Demo 的话术：*“我们让大模型根据实时网络‘踩刹车’或‘加速’，避免云端空转，提升端到端体验和资源利用率。”*
 
@@ -21,7 +21,7 @@
 ```text
 SmartNetDiag/
 ├── smart_agent.py            # eBPF 探针：采集 RTT/重传，滚动聚合写入 CSV
-├── train_model.py            # 无监督训练：Isolation Forest + 标准化 + 验证与可视化
+├── train_model.py            # 双模训练：Isolation Forest 异常检测 + GB 未来健康度预测
 ├── dashboard.py              # Streamlit 实时仪表盘（展示 RTT/重传/异常灯）
 ├── adaptive_token_pacer.py   # LLM 侧边车：按网络动态节流 token 生成；支持 HTTP Hint Server
 ├── run_experiment.sh         # 一键脚本：采集 + 背景流量 + 故障注入
@@ -58,11 +58,15 @@ sudo python3 smart_agent.py \
 ```
 * 输出列含 **min/max/avg/p95 RTT、重传计数** 与滚动平滑列，方便后续特征使用。
 
-### 步骤 B：训练模型（可选，用于识别异常/平滑噪声）
+### 步骤 B：训练模型（可选，用于识别异常/预测未来健康度）
 ```bash
-python3 train_model.py --data /tmp/net_data.csv --contamination 0.15 --estimators 200
+# 模式 1：无监督 Isolation Forest 异常检测
+python3 train_model.py --mode iforest --data /tmp/net_data.csv --contamination 0.15 --estimators 200
+
+# 模式 2：Gradient Boosting 未来健康度预测（输出 0~1 健康分数，预判下一周期）
+python3 train_model.py --mode gb_forecast --data /tmp/net_data.csv --lags 5 --gb-estimators 400 --gb-depth 3
 ```
-* 生成 `isolation_forest.pkl`（含 scaler）+ `model_result.png` + `training_metrics.json`。
+* 模式 1 生成 `network_model.pkl`（Isolation Forest + scaler），模式 2 生成 `network_model.pkl`（含 forecaster bundle），均附 `model_result.png` + `training_metrics.json`。
 
 ### 步骤 C：启动 LLM Token 匀速器（侧边车）
 ```bash
@@ -96,8 +100,11 @@ streamlit run dashboard.py
 ## 5️⃣ 背后的核心逻辑
 
 1. **链路观测**：`smart_agent.py` 挂载 `tcp_rcv_established`、`tcp_retransmit_skb` 采样 RTT/重传；秒级聚合 + 滑动窗口平滑。
-2. **异常/健康度估计**：`train_model.py` 以 RTT/重传为特征训练 Isolation Forest，结合滚动分位数抑制瞬态噪声，可输出健康打分。
-3. **速率映射**：`adaptive_token_pacer.py` 将 p95 RTT 与重传计数映射为 **链路质量系数**，用指数滑动平均调整 target token/s。
+2. **异常/健康度估计 & 预测**：`train_model.py` 提供两种模式——Isolation Forest 标注异常，或 GB 回归预测下一周期健康度（基于滞后特征）；输出健康分数（0~1）。
+3. **速率映射（高级可行方案）**：
+   * **S 型映射**：将健康分数过 S 型曲线转换为 token/s（`knee` 控制“刹车点”，`sharpness` 控制过渡平滑度），避免剧烈抖动。
+   * **观测+预测融合**：实时健康度与“下一步预测”按 `forecast_weight` 融合，链路恶化提前减速，恢复时平滑提速。
+   * **Hint Server/内嵌调用**：`adaptive_token_pacer.py --serve` 输出 `{current_tps, sleep_seconds}`，推理循环按建议休眠即可。
 4. **云端适配方式**：
    * **Hint Server 轮询**：推理线程每 0.3~0.8s 获取 `sleep_seconds`，直接控制生成循环节奏。
    * **内嵌库调用**：将 pacer 逻辑嵌入你的 streaming handler，按返回的 target token/s 自适应节流。

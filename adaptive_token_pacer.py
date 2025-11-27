@@ -13,11 +13,15 @@ that rate to avoid buffering waste during degraded network conditions.
    LLM 服务可在生成循环中定期查询并动态 ``sleep``，实现按链路质量匀速生成。
 """
 import argparse
+import csv
 import json
+import math
 import threading
 import time
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
+
+import pickle
 
 
 def _read_latest_metrics(csv_path: Path) -> Optional[Dict[str, float]]:
@@ -26,22 +30,78 @@ def _read_latest_metrics(csv_path: Path) -> Optional[Dict[str, float]]:
         return None
 
     with csv_path.open() as f:
-        rows = f.readlines()
-    if len(rows) < 2:
+        reader = list(csv.DictReader(f))
+    if not reader:
         return None
 
-    header = [col.strip() for col in rows[0].strip().split(",")]
-    values = [col.strip() for col in rows[-1].strip().split(",")]
-    if len(header) != len(values):
-        return None
-
+    last = reader[-1]
     record: Dict[str, float] = {}
-    for key, val in zip(header, values):
+    for key, val in last.items():
         try:
             record[key] = float(val)
-        except ValueError:
+        except (TypeError, ValueError):
             record[key] = 0.0
     return record
+
+
+def _read_recent_records(csv_path: Path, rows: int) -> Optional[List[Dict[str, float]]]:
+    if not csv_path.exists():
+        return None
+    with csv_path.open() as f:
+        reader = list(csv.DictReader(f))
+    if not reader:
+        return None
+    records: List[Dict[str, float]] = []
+    for row in reader[-rows:]:
+        rec: Dict[str, float] = {}
+        for key, val in row.items():
+            try:
+                rec[key] = float(val)
+            except (TypeError, ValueError):
+                rec[key] = 0.0
+        records.append(rec)
+    return records
+
+
+def _health_score(metrics: Dict[str, float], baseline_rtt_us: float, retrans_budget: float) -> float:
+    rtt_ratio = metrics.get("p95_rtt_us", baseline_rtt_us) / max(baseline_rtt_us, 1e-6)
+    rtt_score = 1 / (1 + rtt_ratio)
+
+    retrans_ratio = metrics.get("retrans_count", 0.0) / max(retrans_budget, 1e-6)
+    retrans_score = 1 / (1 + retrans_ratio)
+
+    return max(0.0, min(1.0, 0.6 * rtt_score + 0.4 * retrans_score))
+
+
+class BundleHealthForecaster:
+    """Use the Gradient Boosting forecaster bundle to predict next-step health."""
+
+    def __init__(self, bundle_path: Path) -> None:
+        self.bundle_path = bundle_path
+        with open(bundle_path, "rb") as f:
+            self.bundle = pickle.load(f)
+        if self.bundle.get("mode") != "gb_forecast":
+            raise ValueError("Bundle is not a gb_forecast model")
+
+    def predict(self, records: List[Dict[str, float]]) -> Optional[float]:
+        lags: int = int(self.bundle["lags"])
+        features = self.bundle["feature_columns"]
+        if len(records) < lags + 1:
+            return None
+
+        window = records[-(lags + 1) :]
+        feature_values: Dict[str, float] = {}
+        for col in features:
+            base, lag = col.rsplit("_lag", 1)
+            lag_idx = int(lag)
+            feature_values[col] = float(window[-(lag_idx + 1)].get(base, 0.0))
+
+        X = [[feature_values[col] for col in features]]
+        scaler = self.bundle["scaler"]
+        model = self.bundle["model"]
+        X_scaled = scaler.transform(X)
+        pred = float(model.predict(X_scaled)[0])
+        return max(0.0, min(1.0, pred))
 
 
 class AdaptiveTokenPacer:
@@ -54,32 +114,41 @@ class AdaptiveTokenPacer:
         rtt_baseline_us: float,
         retrans_budget: float,
         smoothing: float,
+        knee: float,
+        sharpness: float,
+        forecast_weight: float,
+        forecaster: Optional[BundleHealthForecaster] = None,
+        csv_path: Optional[Path] = None,
     ) -> None:
         self.max_tps = max_tps
         self.min_tps = min_tps
         self.rtt_baseline_us = rtt_baseline_us
         self.retrans_budget = retrans_budget
         self.smoothing = smoothing
+        self.knee = knee
+        self.sharpness = sharpness
+        self.forecast_weight = forecast_weight
+        self.forecaster = forecaster
+        self.csv_path = csv_path
         self.current_tps = max_tps
         self._lock = threading.Lock()
 
     def update(self, metrics: Optional[Dict[str, float]]) -> float:
-        """Blend a new target rate from RTT and retransmission health."""
+        """Blend a new target rate from observed and forecast health."""
         if metrics is None:
             return self.current_tps
 
-        p95_rtt = metrics.get("p95_rtt_us", 0.0)
-        retrans = metrics.get("retrans_count", 0.0)
+        observed_health = _health_score(metrics, self.rtt_baseline_us, self.retrans_budget)
+        blended_health = observed_health
 
-        quality = 1.0
-        if p95_rtt > 0:
-            rtt_factor = min(1.0, self.rtt_baseline_us / p95_rtt)
-            quality *= rtt_factor
+        if self.forecaster and self.csv_path:
+            recent_records = _read_recent_records(self.csv_path, self.forecaster.bundle["lags"] + 2)
+            if recent_records is not None:
+                predicted = self.forecaster.predict(recent_records)
+                if predicted is not None:
+                    blended_health = (1 - self.forecast_weight) * observed_health + self.forecast_weight * predicted
 
-        if retrans > self.retrans_budget:
-            quality *= self.retrans_budget / max(retrans, 1e-6)
-
-        target = max(self.min_tps, min(self.max_tps, quality * self.max_tps))
+        target = self._health_to_tps(blended_health)
         new_tps = (1 - self.smoothing) * self.current_tps + self.smoothing * target
 
         with self._lock:
@@ -89,6 +158,10 @@ class AdaptiveTokenPacer:
     def get_rate(self) -> float:
         with self._lock:
             return self.current_tps
+
+    def _health_to_tps(self, health: float) -> float:
+        span = self.max_tps - self.min_tps
+        return self.min_tps + span / (1 + math.exp(-self.sharpness * (health - self.knee)))
 
 
 class PacingHintServer(threading.Thread):
@@ -181,6 +254,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rtt-baseline-us", type=float, default=40_000.0, help="healthy p95 RTT (microseconds)")
     parser.add_argument("--retrans-budget", type=float, default=2.0, help="acceptable retransmissions per interval")
     parser.add_argument("--smoothing", type=float, default=0.2, help="EMA smoothing factor for rate changes")
+    parser.add_argument("--knee", type=float, default=0.55, help="health-to-tps sigmoid knee (0-1)")
+    parser.add_argument("--sharpness", type=float, default=8.0, help="health-to-tps sigmoid sharpness")
+    parser.add_argument("--forecast-model", type=Path, default=None, help="optional gb_forecast bundle to look ahead")
+    parser.add_argument("--forecast-weight", type=float, default=0.35, help="weight of forecast vs observed health")
     parser.add_argument("--refresh", type=float, default=1.0, help="seconds between metric reads")
     parser.add_argument("--mode", choices=["word", "char"], default="word", help="tokenization granularity")
     parser.add_argument("--serve", type=int, default=None, help="start HTTP hint server on the given port")
@@ -189,12 +266,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    forecaster = None
+    if args.forecast_model:
+        try:
+            forecaster = BundleHealthForecaster(args.forecast_model)
+            print(f"Loaded forecast bundle from {args.forecast_model}")
+        except Exception as exc:  # pragma: no cover - defensive
+            raise SystemExit(f"Failed to load forecast model: {exc}")
+
     pacer = AdaptiveTokenPacer(
         max_tps=args.max_tps,
         min_tps=args.min_tps,
         rtt_baseline_us=args.rtt_baseline_us,
         retrans_budget=args.retrans_budget,
         smoothing=args.smoothing,
+        knee=args.knee,
+        sharpness=args.sharpness,
+        forecast_weight=args.forecast_weight,
+        forecaster=forecaster,
+        csv_path=args.csv,
     )
 
     if args.serve:
