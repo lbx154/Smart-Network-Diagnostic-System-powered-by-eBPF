@@ -1,156 +1,129 @@
-# 🚀 SmartNetDiag: 基于 eBPF + AI 的智能网络诊断系统
+# 🛰️ NetDiag-LLM：用 eBPF 让 Token 按网速匀速生成
 
-> **Smart Network Diagnostic System powered by eBPF & Isolation Forest**
+> **把网络诊断落地到 LLM 流式推理** —— 云端不再盲目“狂飙” token，根据链路质量实时调节生成速率，做到“网速能传多少，就生成多少”。
 
-[![eBPF](https://img.shields.io/badge/Linux-eBPF-orange.svg)](https://ebpf.io/)
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
-[![AI](https://img.shields.io/badge/Model-Isolation%20Forest-green.svg)](https://scikit-learn.org/)
-[![Dashboard](https://img.shields.io/badge/Dashboard-Streamlit-red.svg)](https://streamlit.io/)
+[![eBPF](https://img.shields.io/badge/Linux-eBPF-orange.svg)](https://ebpf.io/) [![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/) [![AI](https://img.shields.io/badge/Model-Isolation%20Forest-green.svg)](https://scikit-learn.org/) [![Dashboard](https://img.shields.io/badge/LLM-Token%20Pacing-purple.svg)]()
 
-SmartNetDiag 是一个轻量级、低开销的实时网络诊断系统。它利用 **eBPF (Extended Berkeley Packet Filter)** 技术在 Linux 内核态零拷贝采集 TCP 关键指标（RTT、重传），并结合 **孤立森林 (Isolation Forest)** 无监督学习算法，实现对网络异常（如拥塞、丢包）的实时检测与根因分析。
+## 1️⃣ 这是一个什么项目？
+
+传统 LLM 云端推理的 token 生成速率固定，客户端网络却时快时慢：当链路抖动或吞吐下降时，云端会“过度生产”而被迫丢弃/等待，算力与带宽双重浪费。**NetDiag-LLM** 将网络异常检测与 LLM 流式生成耦合：
+
+1. **eBPF 数据面**：在内核挂载探针，秒级采集 TCP RTT、重传等真实指标，生成干净的 `net_data.csv`。  
+2. **AI 智能面**：用 Isolation Forest/滚动分位数等特征感知链路质量，自动平滑尖峰。  
+3. **LLM 侧边车**：`adaptive_token_pacer.py` 将“网络健康度”映射为 **token/s 建议值**，并通过 HTTP Hint Server 供云端/边缘节点轮询，直接控制生成循环的休眠节奏。
+
+> 课堂 Demo 的话术：*“我们让大模型根据实时网络‘踩刹车’或‘加速’，避免云端空转，提升端到端体验和资源利用率。”*
 
 ---
 
-## 📂 项目目录结构
+## 2️⃣ 项目结构速览
 
 ```text
 SmartNetDiag/
-├── 📄 run_experiment.sh   # [一键启动] 自动化实验脚本 (采集+流量+故障注入)
-├── 📄 smart_agent.py      # [数据平面] eBPF 探针，负责内核数据采集与清洗
-├── 📄 chaos_maker.py      # [测试工具] 基于 tc 的网络故障注入器
-├── 📄 train_model.py      # [智能平面] 读取 CSV 数据，训练模型并评估
-├── 📄 dashboard.py        # [应用平面] Streamlit 实时监控仪表盘
-├── 📄 visualize_data.py   # [分析工具] 简单的数据分布可视化脚本
-├── 📄 requirements.txt    # Python 依赖库列表
-└── 📄 README.md           # 项目说明文档
+├── smart_agent.py            # eBPF 探针：采集 RTT/重传，滚动聚合写入 CSV
+├── train_model.py            # 无监督训练：Isolation Forest + 标准化 + 验证与可视化
+├── dashboard.py              # Streamlit 实时仪表盘（展示 RTT/重传/异常灯）
+├── adaptive_token_pacer.py   # LLM 侧边车：按网络动态节流 token 生成；支持 HTTP Hint Server
+├── run_experiment.sh         # 一键脚本：采集 + 背景流量 + 故障注入
+├── chaos_maker.py            # 基于 tc 的延迟/丢包注入器
+├── visualize_data.py         # 简单数据分布可视化
+└── README.md                 # 本说明
 ```
 
 ---
 
-## 🛠️ 环境搭建 (Installation)
+## 3️⃣ 为什么能吸引老师？（亮点卖点）
 
-本项目推荐运行在 **Ubuntu 20.04/22.04 LTS** (物理机、虚拟机或 WSL2) 环境下。
-
-### 1. 系统依赖安装 (eBPF 工具链)
-
-eBPF 依赖较新的内核头文件，请确保系统内核版本 >= 5.8。
-
-```bash
-# 更新源
-sudo apt update
-
-# 安装 BCC 工具链及内核头文件
-sudo apt install -y bison flex build-essential libssl-dev libelf-dev zlib1g-dev \
-libfl-dev systemtap-sdt-dev clang llvm \
-bpfcc-tools python3-bpfcc libbpfcc libbpfcc-dev linux-headers-$(uname -r)
-
-# 仅限 WSL2 用户：
-# 如果遇到头文件缺失问题，需手动下载微软 WSL2 内核源码并编译头文件。
-# (此处省略详细 WSL2 内核编译步骤，具体参考项目文档)
-```
-
-### 2. Python 依赖安装
-
-```bash
-# 安装项目所需的 Python 库
-pip3 install -r requirements.txt
-```
-
-*`requirements.txt` 内容参考：*
-```text
-numpy
-pandas
-scikit-learn
-streamlit
-matplotlib
-joblib
-altair
-```
+* **网络 × 大模型的跨层创新**：把 eBPF 的链路洞察直接驱动 LLM 流式生成速率，解决“算力空转、带宽浪费”这一新痛点。  
+* **实时、零侵入**：eBPF 采集无需改应用代码；Hint Server 用 HTTP/JSON 暴露速率建议，推理循环几行代码即可接入。  
+* **可视化+可复现**：仪表盘实时看 RTT/重传与异常灯；训练过程保留可视化 `model_result.png` 和指标 `training_metrics.json`。  
+* **课堂演示友好**：自带故障注入脚本，能在 3~5 分钟内复现“链路抖动 → token 自动降速”的完整闭环。
 
 ---
 
-## 🚀 快速开始 (Workflow)
+## 4️⃣ 快速开始：5 分钟跑通“网络感知的 LLM”
 
-整个系统分为三个阶段：**数据采集 → 模型训练 → 实时监控**。
+### 环境准备
+* **OS**：Ubuntu 20.04/22.04（物理机/虚拟机/WSL2）
+* **内核**：>= 5.8，需安装 BCC/eBPF 工具链（`bpfcc-tools`、`libbpfcc-dev` 等）
+* **Python 依赖**：`pip3 install -r requirements.txt`
 
-### 第一步：数据采集与故障模拟 (Data Collection)
-
-我们提供了一个自动化脚本，它会同时启动：
-1.  **Smart Agent**: eBPF 探针，采集 RTT 和重传数据。
-2.  **Traffic Generator**: 后台运行 `wget` 维持长连接流量。
-3.  **Chaos Maker**: 使用 `tc` (Traffic Control) 随机注入“高延迟”或“丢包”故障。
-
+### 步骤 A：采集真实链路指标
 ```bash
-# ⚠️ 必须使用 sudo 运行，因为 eBPF 需要 root 权限
-sudo bash run_experiment.sh
+sudo python3 smart_agent.py \
+  --interval 0.5 \
+  --window 60 \
+  --csv /tmp/net_data.csv \
+  --max-samples 8000
+```
+* 输出列含 **min/max/avg/p95 RTT、重传计数** 与滚动平滑列，方便后续特征使用。
+
+### 步骤 B：训练模型（可选，用于识别异常/平滑噪声）
+```bash
+python3 train_model.py --data /tmp/net_data.csv --contamination 0.15 --estimators 200
+```
+* 生成 `isolation_forest.pkl`（含 scaler）+ `model_result.png` + `training_metrics.json`。
+
+### 步骤 C：启动 LLM Token 匀速器（侧边车）
+```bash
+# 本地串联示例：根据链路健康度调整 token/s
+python3 adaptive_token_pacer.py "Once upon a time..." \
+  --csv /tmp/net_data.csv \
+  --max-tps 60 --min-tps 5 \
+  --mode word
+
+# 如果需要给云端/边缘节点查询，启动 HTTP Hint Server
+python3 adaptive_token_pacer.py --csv /tmp/net_data.csv --serve 9000 --max-tps 80
+```
+服务器端（推理循环）只需定期轮询：
+```python
+import requests, time
+while True:
+    hint = requests.get("http://<pacer_host>:9000", timeout=0.2).json()
+    token = llm.generate_next()
+    send_to_client(token)
+    time.sleep(hint["sleep_seconds"])  # 按网络建议休眠，能传多少就生成多少
 ```
 
-*   **输出**：数据将实时写入 `net_data.csv`。
-*   **操作**：运行约 5-10 分钟后，按 `Ctrl+C` 停止实验。
-
-### 第二步：模型训练 (Model Training)
-
-利用采集到的 `net_data.csv`，训练 Isolation Forest 模型。
-
+### 步骤 D：课堂可视化（可选）
 ```bash
-python3 train_model.py
-```
-
-*   **功能**：
-    *   清洗数据。
-    *   训练无监督异常检测模型。
-    *   生成可视化散点图 `model_result.png` 以验证模型效果。
-*   **输出**：生成模型文件 `isolation_forest.pkl`。
-
-### 第三步：启动实时监控看板 (Dashboard)
-
-启动 Streamlit 前端页面，加载训练好的模型，对实时网络状态进行推断和展示。
-
-**注意**：为了展示实时效果，建议重新运行 `run_experiment.sh` (让它在后台产生数据)，然后新开一个终端启动 Dashboard。
-
-```bash
-# 启动 Dashboard
 streamlit run dashboard.py
 ```
-
-*   **访问地址**：打开浏览器访问 `http://localhost:8501`
-*   **功能演示**：
-    *   观察 RTT 实时折线图。
-    *   当后台注入故障时，观察右上角 AI 状态是否变为 🔴 **异常**。
+* 在浏览器访问 `http://localhost:8501`，实时观察 RTT/重传与 AI 异常灯。
 
 ---
 
-## 📊 实验结果展示
+## 5️⃣ 背后的核心逻辑
 
-### 1. 数据特征分布 (Data Distribution)
-通过 eBPF 采集的数据呈现清晰的 "L" 型分布：
-*   **正常流量**：聚集在原点 (低延迟，无重传)。
-*   **拥塞异常**：沿 X 轴延伸 (高延迟，无重传)。
-*   **丢包异常**：沿 Y 轴延伸 (低延迟，高重传)。
-
-### 2. 实时监控界面
-Dashboard 能够毫秒级捕捉网络波动，并标记异常点。
-
-> *(此处可插入你的 Dashboard 截图)*
+1. **链路观测**：`smart_agent.py` 挂载 `tcp_rcv_established`、`tcp_retransmit_skb` 采样 RTT/重传；秒级聚合 + 滑动窗口平滑。
+2. **异常/健康度估计**：`train_model.py` 以 RTT/重传为特征训练 Isolation Forest，结合滚动分位数抑制瞬态噪声，可输出健康打分。
+3. **速率映射**：`adaptive_token_pacer.py` 将 p95 RTT 与重传计数映射为 **链路质量系数**，用指数滑动平均调整 target token/s。
+4. **云端适配方式**：
+   * **Hint Server 轮询**：推理线程每 0.3~0.8s 获取 `sleep_seconds`，直接控制生成循环节奏。
+   * **内嵌库调用**：将 pacer 逻辑嵌入你的 streaming handler，按返回的 target token/s 自适应节流。
 
 ---
 
-## 🌟 项目亮点 (Highlights)
+## 6️⃣ 教学 Demo 剧本（3~5 分钟）
 
-*   **零侵入性**：基于 eBPF 技术，无需修改内核源码，无需重启应用，性能开销极低。
-*   **真实指标**：通过 Hook `tcp_rcv_established` 和 `tcp_retransmit_skb`，获取内核协议栈真实的 RTT 和重传事件，比 Ping 更准确。
-*   **智能诊断**：摒弃传统的静态阈值报警，使用 **Isolation Forest** 自动学习网络基线，能够适应不同的网络环境。
-*   **全栈闭环**：实现了从底层内核采集、故障模拟、模型训练到上层可视化展示的完整工程链路。
+1. `sudo bash run_experiment.sh` 启动采集 + 背景长连接 + 随机延迟/丢包注入。  
+2. 终端 A 观察 `net_data.csv` 的 RTT/重传跳变；终端 B 启动 `adaptive_token_pacer.py --serve 9000`。  
+3. 在推理伪代码/Notebook 中展示 `sleep_seconds` 随故障增大而上升，token 输出自动变慢。  
+4. （可选）在浏览器打开 `streamlit run dashboard.py`，让老师看到仪表盘异常灯与 Hint Server 曲线联动。
 
----
-
-## 📝 License
-
-此项目仅供计算机网络课程学习与研究使用。
+> 结尾金句：*“我们不再盲目把 token 全部推向抖动的链路，而是让网络状态直接驱动生成节奏。”*
 
 ---
 
-### 👨‍💻 作者
-*   **姓名**：[你的名字]
-*   **学号**：[你的学号]
-*   **专业**：计算机科学与技术
+## 7️⃣ 常见问题（FAQ）
+
+* **WSL2 找不到内核头文件**：需要手动下载微软发布的 WSL2 内核源码并安装对应版本的 headers。
+* **Hint Server 延迟**：建议将 pacer 部署在距离推理节点近的同机/同子网，轮询间隔保持在亚秒级。
+* **大规模部署**：可将 pacer 逻辑移植到网关/边缘代理层，或用消息队列推送速率建议，统一调度多路流式连接。
+
+---
+
+## 8️⃣ License & 致谢
+
+本项目仅供计算机网络课程学习与研究使用。欢迎在课堂/实验中自由改造并注明来源。
+
